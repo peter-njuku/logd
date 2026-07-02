@@ -98,89 +98,113 @@ go run . /path/to/log/dir
 
 ## Usage
 
-Run the binary and point it at a directory that contains log files:
+# logd
+
+`logd` is a small Linux-native log tailing and aggregation utility written in Go. It watches a directory for `*.log` files, follows each file from the current end, tails newly created `*.log` files, and forwards new log lines as structured JSON records to one of several output targets (stdout, UDP, or WebSocket).
+
+The implementation combines efficient event-driven tailing using `inotify` with a simple multi-file manager to follow many files concurrently.
+
+**Quick summary**
+
+- Watches a directory for `*.log` files and tails them from the current end-of-file
+- Emits newline-delimited JSON records (one JSON object per log line)
+- Supports writing to `stdout`, sending JSON over UDP (`-udp`), or broadcasting to WebSocket clients (`-ws`)
+- Clean shutdown on `SIGINT`/`SIGTERM`
+
+## What it does
+
+When you run `logd` against a directory it will:
+
+- scan the directory for existing `*.log` files and start tailing each one from EOF
+- register an `inotify` watch on the directory to discover new or removed files
+- register an `inotify` watch per active file to detect modifications and rotation-like events
+- emit each new log line as a JSON object with `file`, `line`, and `timestamp` fields
+- optionally forward the JSON lines to a UDP endpoint or broadcast them to connected WebSocket clients
+
+## Command-line flags
+
+- `-udp <host:port>` : send each JSON log line as a single UDP packet to the given address (e.g. `localhost:514`)
+- `-ws <addr>` : listen on the specified HTTP address and serve WebSocket clients at the `/ws` path (e.g. `:8080`)
+- `-verbose` : print debug information to stderr
+- `-help` : show usage
+
+## Output format
+
+Each emitted line is a JSON object followed by a single newline. Example:
+
+```json
+{"file":"app.log","line":"user logged in","timestamp":"2026-07-02T12:34:56.789012345Z"}
+```
+
+- `file`: the basename used to identify the file the line came from
+- `line`: the log text (the trailing newline is removed)
+- `timestamp`: RFC3339Nano UTC timestamp added at emission time
+
+When running without `-udp` or `-ws` the JSON lines are written to `stdout`. With `-udp` they are sent as UDP packets to the configured address. With `-ws` the server accepts WebSocket clients on `/ws` and sends each JSON message to connected clients.
+
+## Examples
+
+Run against a directory and print JSON to stdout:
 
 ```bash
 ./logd /path/to/log/dir
 ```
 
-Example:
+Send JSON lines over UDP:
 
 ```bash
-mkdir -p /tmp/example-logs
-printf 'first line\n' > /tmp/example-logs/app.log
-./logd /tmp/example-logs
+./logd -udp localhost:514 /path/to/log/dir
 ```
 
-Then append more data:
+Start an HTTP server and broadcast to WebSocket clients on `/ws`:
 
 ```bash
-printf 'second line\n' >> /tmp/example-logs/app.log
+./logd -ws :8080 /path/to/log/dir
+# then connect a browser or websocket client to ws://localhost:8080/ws
 ```
 
-You should see output similar to:
+## Files of interest
 
-```text
-[app.log] - second line
+- [main.go](main.go) — program entrypoint, flag parsing, `inotify` directory watch, tailer lifecycle management, shutdown handling
+- [tailer.go](tailer.go) — per-file tailer: opens file, seeks to EOF, reads new lines and marshals JSON records
+- [websocket.go](websocket.go) — optional WebSocket broadcaster and `/ws` handler
+
+## Requirements
+
+- Linux with `inotify` support
+- Go 1.26.3 or newer (see `go.mod`)
+
+## Build
+
+```bash
+git clone https://github.com/peter-njuku/logd.git
+cd logd
+go build -o logd .
 ```
 
-## Output format
+Run without building:
 
-Each new line is emitted to stdout in the following form:
-
-```text
-[<filename>] - <line content>
+```bash
+go run . /path/to/log/dir
 ```
 
-This makes it easy to spot which source file produced the output.
+## Behavior notes and caveats
 
-## Behavior notes
-
-- The program starts at the current end of each file, so it does not print historical contents.
-- It is line-oriented and assumes log entries are newline-delimited.
-- It is designed for local, lightweight use rather than high-scale distributed logging.
-- It depends on Linux kernel event notifications and is not portable to non-Linux systems.
+- The program begins tailing from EOF, so it will not print existing historical content.
+- Lines are assumed to be newline-terminated; partial lines will be delivered once a newline is observed.
+- The tailer writes JSON to the configured sink; if a UDP sink is used, packets may be dropped or truncated by the network.
+- The WebSocket server exposes `/ws` and sends raw JSON messages; clients should expect newline-delimited JSON per message.
+- The implementation is intentionally small and focused; it does not attempt to be a full-featured log transport system.
 
 ## Developer notes
 
-### Code organization
+Potential improvements:
 
-The project is intentionally small, which makes it easy to extend.
-
-Potential extension points include:
-
-- replacing stdout with a callback, queue, or sink interface;
-- adding configuration flags for output destination, verbosity, or follow mode;
-- supporting recursive directory watching;
-- adding structured parsing for JSON or other log formats;
-- improving handling for truncation, rotation, and inode changes;
-- adding tests for create/delete/rename/recreate flows.
-
-### Current limitations
-
-- Linux-specific
-- No configuration file or flags yet
-- No built-in filtering, parsing, or routing
-- Output is plain text only
-
-## Why this project exists
-
-The repository was created as a practical synthesis of the tailing and aggregation concepts explored in the two referenced projects:
-
-- `tiny_tail_f` contributed the efficient, event-driven tailing approach for a single file.
-- `log_aggregator` contributed the directory-level idea of discovering and following multiple logs in one place.
-
-This repository combines both approaches into a single tool that can follow a folder of log files without a polling loop.
-
-## Contributing
-
-Contributions are welcome. If you want to improve the tool, consider:
-
-- adding tests;
-- improving cross-file lifecycle handling;
-- introducing configurable output targets;
-- documenting behavior around log rotation and truncation.
+- add optional filtering or include/exclude patterns
+- support recursive directory watching
+- add backpressure or batching for network sinks
+- add tests for rotation/truncation scenarios
 
 ## License
 
-No license has been declared in the repository yet. If you plan to reuse or redistribute this code, confirm the licensing terms before doing so.
+No license has been declared. Please add a license file if you intend to reuse or redistribute this code.
