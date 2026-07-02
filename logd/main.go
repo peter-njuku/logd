@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,15 +19,59 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var verbose bool
+
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <directory>", os.Args[0])
+	udpAddr := flag.String("udp", "", "UDP Address to send our logs to(eg. localhost:514)")
+	wsAddr := flag.String("ws", "", "WebSocket address to serve logs on (eg. :8080)")
+	verboseFlag := flag.Bool("verbose", false, "Print debug info on stderr")
+	help := flag.Bool("help", false, "Show this help message")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <directory>", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options: \n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if *help {
+		flag.Usage()
+		os.Exit(0)
 	}
 
-	dir := os.Args[1]
+	verbose = *verboseFlag
 
+	dir := flag.Arg(0)
+	if dir == "" {
+		log.Fatalf("Usage: %s [options] <directory>", os.Args[0])
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	var out io.Writer = os.Stdout
+	if *udpAddr != "" {
+		conn, err := net.Dial("udp4", *udpAddr)
+		if err != nil {
+			log.Fatalf("UDP Dial error: %v", err)
+		}
+		defer conn.Close()
+		out = conn
+		fmt.Fprintf(os.Stderr, "Sending logs to UDP %s\n", *udpAddr)
+	}
+
+	var broadcast chan []byte
+
+	if *wsAddr != "" {
+		broadcast = make(chan []byte)
+		go broadcaster(broadcast)
+
+		http.Handle("/ws", wsHandler())
+		go func() {
+			log.Printf("Websocket server listening on %s", *wsAddr)
+			if err := http.ListenAndServe(*wsAddr, nil); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
 
 	var pipeFds [2]int
 	if err := unix.Pipe(pipeFds[:]); err != nil {
@@ -55,7 +103,7 @@ func main() {
 
 	for _, f := range files {
 		name := filepath.Base(f)
-		startTailer(ctx, filepath.Join(dir, name), name, inotifyFd, active, &wg)
+		startTailer(ctx, filepath.Join(dir, name), name, inotifyFd, active, &wg, out, broadcast)
 	}
 
 	go func() {
@@ -69,10 +117,7 @@ func main() {
 		fdSet.Bits[inotifyFd/64] |= 1 << (uint(inotifyFd) % 64)
 		fdSet.Bits[pipeRead/64] |= 1 << (uint(pipeRead) % 64)
 
-		maxFd := inotifyFd
-		if pipeRead > maxFd {
-			maxFd = pipeRead
-		}
+		maxFd := max(pipeRead, inotifyFd)
 
 		_, err := unix.Select(maxFd+1, fdSet, nil, nil, nil)
 		if err != nil {
@@ -109,10 +154,10 @@ func main() {
 					}
 					if event.Wd == int32(wdDir) {
 						if event.Mask&unix.IN_CREATE != 0 {
-							fmt.Fprintf(os.Stderr, "New file detected: %s\n", name)
+							debugf("New file detected: %s\n", name)
 							if matched, _ := filepath.Match("*.log", name); matched && !strings.HasPrefix(name, ".") {
 								if _, exists := active[name]; !exists {
-									startTailer(ctx, filepath.Join(dir, name), name, inotifyFd, active, &wg)
+									startTailer(ctx, filepath.Join(dir, name), name, inotifyFd, active, &wg, out, broadcast)
 								}
 							}
 						}
@@ -121,7 +166,7 @@ func main() {
 								t.cancel()
 								t.f.Close()
 								delete(active, name)
-								fmt.Fprintf(os.Stderr, "Stopped: %s\n", name)
+								debugf("Stopped: %s\n", name)
 							}
 						}
 					} else {
@@ -130,7 +175,9 @@ func main() {
 								if event.Mask&unix.IN_MODIFY != 0 {
 									select {
 									case t.notify <- struct{}{}:
+										debugf("DEBUG notified: %s\n", basename)
 									default:
+										debugf("DEBUG notify full: %s\n", basename)
 									}
 								}
 
@@ -138,7 +185,7 @@ func main() {
 									t.cancel()
 									t.f.Close()
 									delete(active, basename)
-									fmt.Fprintf(os.Stderr, "Stopped: %s (moved)\n", basename)
+									debugf("Stopped: %s (moved)\n", basename)
 								}
 								break
 							}
@@ -158,7 +205,13 @@ func main() {
 			t.f.Close()
 		}
 	}
-	fmt.Fprintln(os.Stderr, "waiting for tailers...")
+	debugf("waiting for tailers...")
 	wg.Wait()
 	fmt.Println("All trailers stopped")
+}
+
+func debugf(format string, args ...interface{}) {
+	if verbose {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
 }

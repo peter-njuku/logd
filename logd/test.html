@@ -1,0 +1,24 @@
+
+<!DOCTYPE html>
+<html>
+<body>
+<h2>Live Logs</h2>
+<pre id="log"></pre>
+<script>
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onopen = () => console.log("Connected to WebSocket");
+ws.onmessage = (e) => {
+    // If the message is a Blob, convert it to text first
+    if (e.data instanceof Blob) {
+        e.data.text().then(text => {
+            document.getElementById("log").textContent += text + "\n";
+        });
+    } else {
+        document.getElementById("log").textContent += e.data + "\n";
+    }
+};
+ws.onclose = () => console.log("Disconnected");
+ws.onerror = (err) => console.error("WebSocket error", err);
+</script>
+</body>
+</html>
